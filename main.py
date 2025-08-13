@@ -197,9 +197,7 @@ class BackstageDCRHandler:
             "DiscoveryHandler:: failed at both endpoints:\n  - " + "\n  - ".join(errors)
         )
 
-    def register(
-        self, disc: "Discovery", headers: "dict[str, str]"
-    ) -> "dict[str, Any]":
+    def register(self, disc: "Discovery", headers: "dict[str, str]") -> "dict[str, Any]":
         """
         registers a client in backstage
         """
@@ -209,7 +207,7 @@ class BackstageDCRHandler:
             extra_headers=headers,
         )
 
-    def save(disc: "Discovery", res: "dict[str, Any]") -> "None":
+    def save(self, disc: "Discovery", res: "dict[str, Any]") -> "None":
         """
         saves your credentials locally
         """
