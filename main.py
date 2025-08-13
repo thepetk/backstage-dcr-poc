@@ -13,10 +13,13 @@
 # used for production as there is a risk of leaking
 # sensitive data.
 
+import base64
+import hashlib
 import json
 import logging
 import os
 import time
+import urllib.parse
 from dataclasses import dataclass
 from typing import Any
 
@@ -51,6 +54,9 @@ CLIENT_METADATA: "dict[str, Any]" = {
     "software_id": "lightspeed-stack-local",
     "software_version": "0.1.0",
 }
+
+# RUN_AUTH_CODE_FLOW: Flag to run the authorization code generation
+RUN_AUTH_CODE_FLOW: "bool" = bool(os.getenv("RUN_AUTH_CODE_FLOW", 1))
 
 # Logger configuration
 logging.basicConfig(
@@ -90,12 +96,16 @@ class RequestHandler:
         self,
         url: "str",
         payload: "dict[str, Any]",
+        auth: "tuple[str, str] | None" = None,
         extra_headers: "dict[str, str] | None" = None,
     ) -> "dict[str, Any]":
         """
         sends a POST request to the given url with the given headers
         """
         _headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if auth:
+            _headers["Content-Type"] = "application/x-www-form-urlencoded"
+
         if extra_headers:
             _headers.update(extra_headers)
 
@@ -103,7 +113,21 @@ class RequestHandler:
             f"RequestHandler:: POST {url} payload={json.dumps(payload, separators=(',', ':'))}"
         )
 
-        res = requests.post(url, json=payload, headers=_headers, timeout=TIMEOUT)
+        if auth:
+            res = requests.post(
+                url,
+                data=payload,
+                headers=_headers,
+                timeout=self.timeout,
+                auth=auth,
+            )
+        else:
+            res = requests.post(
+                url,
+                json=payload,
+                headers=_headers,
+                timeout=self.timeout,
+            )
 
         ctype = res.headers.get("content-type", "")
         if not res.ok and "application/json" in ctype:
@@ -237,6 +261,117 @@ class BackstageDCRHandler:
 
         logger.info(f"main:: Creds saved at {OUTPUT_FILE}")
 
+    def _urlsafe_random(self, nbytes: "int" = 64) -> "str":
+        "creates a random string"
+        return base64.urlsafe_b64encode(os.urandom(nbytes)).decode("ascii").rstrip("=")
+
+    def _b64url_sha256(self, data: "bytes") -> "str":
+        "encodes the given data using its hash"
+        return (
+            base64.urlsafe_b64encode(hashlib.sha256(data).digest())
+            .decode("ascii")
+            .rstrip("=")
+        )
+
+    def build_authorization_url(
+        self,
+        disc: "Discovery",
+        client_id: "str",
+        redirect_uri: "str",
+        scope: "str",
+        state: "str",
+        code_challenge: "str",
+    ) -> "str":
+        """
+        builds an authorization url for /authorize endpoint
+        https://www.oauth.com/oauth2-servers/authorization/the-authorization-request
+        """
+        qs = {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "scope": scope,
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
+        return f"{disc.authorization_endpoint}?{urllib.parse.urlencode(qs)}"
+
+    def run_auth_code_pkce(
+        self,
+        disc: "Discovery",
+        client: "dict[str, Any]",
+        redirect_uri: "str",
+    ) -> "dict[str, Any]":
+        """
+        runs the browser Authorization Code - PKCE flow:
+        - prints an authorization URL
+        - peads ?code= from stdin
+        - exchanges code for tokens at token_endpoint
+        """
+        client_id = client.get("client_id")
+        client_secret = client.get("client_secret")
+        scope = CLIENT_METADATA.get("scope", "openid profile email")
+
+        # creates the PKCE (Proof Key for Code Exchange)
+        # https://www.stefaanlippens.net/oauth-code-flow-pkce.html
+        code_verifier = self._urlsafe_random(64)
+        code_challenge = self._b64url_sha256(code_verifier.encode("ascii"))
+        state = self._urlsafe_random(16)
+
+        authz_url = self.build_authorization_url(
+            disc=disc,
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            scope=scope,
+            state=state,
+            code_challenge=code_challenge,
+        )
+
+        logger.info("BackstageDCRHandler:: === Authorization URL (open in browser) ===")
+        logger.info(f"BackstageDCRHandler:: authorization url {authz_url}")
+        logger.info(
+            "BackstageDCRHandler::After approving, paste the 'code' query param here."
+        )
+        code = input("BackstageDCRHandler:: Enter the code = ").strip()
+        if not code:
+            raise ValueError("BackstageDCRHandler:: No authorization code provided")
+
+        # exchange tokens
+        payload = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "code_verifier": code_verifier,
+        }
+
+        token_response = self.request_handler.http_post_json(
+            disc.token_endpoint,
+            payload=payload,
+            auth=(client_id, client_secret),
+        )
+
+        # update creds file
+        try:
+            with open(OUTPUT_FILE, "r") as f:
+                current = json.load(f)
+        except Exception:
+            current = {}
+
+        current.setdefault("auth_test", {})
+        current["auth_test"]["pkce"] = {
+            "used_redirect_uri": redirect_uri,
+            "state": state,
+            "token_response": token_response,
+        }
+
+        with open(OUTPUT_FILE, "w") as f:
+            json.dump(current, f, indent=2)
+        logger.info(
+            "main:: Auth Code  PKCE succeeded; tokens saved under 'auth_test.pkce'"
+        )
+        return token_response
+
 
 def main() -> "int":
     logger.info(f"main:: Backend base: {DEFAULT_BACKEND_BASE}")
@@ -257,6 +392,17 @@ def main() -> "int":
     res = dcr_handler.register(disc, headers)
 
     dcr_handler.save(disc, res)
+
+    if RUN_AUTH_CODE_FLOW:
+        redirect_uri = CLIENT_METADATA["redirect_uris"][0]
+        dcr_handler.run_auth_code_pkce(
+            disc=disc,
+            client={
+                "client_id": res.get("client_id"),
+                "client_secret": res.get("client_secret"),
+            },
+            redirect_uri=redirect_uri,
+        )
     return 0
 
 
