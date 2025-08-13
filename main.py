@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+
+# The current script is a very simple implementation
+# that stands as a PoC for LSCore and the suggested
+# new Dynamic Client Registration feature for backstage
+
+# The backstage feature has been suggested here:
+
+# https://github.com/backstage/backstage/pull/30606
+
+# NOTE [IMPORTANT]: This script is only meant for
+# testing, do not try this with Backstage instances
+# used for production as there is a risk of leaking
+# sensitive data.
+
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass
+from typing import Any
+
+import requests
+
+# DEFAULT_BACKEND_BASE: Default base for auth endpoints
+DEFAULT_BACKEND_BASE = os.getenv(
+    "BACKSTAGE_BASE_URL", "http://localhost:7007/api/auth"
+).rstrip("/")
+
+# INITIAL_ACCESS_TOKEN [OPTIONAL]: any already existing
+# bearer token
+INITIAL_ACCESS_TOKEN = os.getenv("INITIAL_ACCESS_TOKEN")
+
+# OUTPUT_FILE: The path we are going to save the credentials
+OUTPUT_FILE = os.getenv("OUTPUT_FILE", "oauth_credentials.json")
+
+# TIMEOUT: The timeout value for the backstage requests
+TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "10"))
+
+# CLIENT_METADATA: The medata required for lightspeed stack
+CLIENT_METADATA: "dict[str, Any]" = {
+    "client_name": "lightspeed-stack (local dev)",
+    "redirect_uris": [
+        "http://localhost:8080/auth/callback",
+        "http://localhost:8080/auth/backstage/callback",
+    ],
+    "grant_types": ["authorization_code"],
+    "response_types": ["code"],
+    "token_endpoint_auth_method": "client_secret_basic",
+    "scope": "openid profile email",
+    "software_id": "lightspeed-stack-local",
+    "software_version": "0.1.0",
+}
+
+# Logger configuration
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("dcr")
+
+
+def get_key_or_raise_error(d: "dict[str, Any]", key: "str") -> "Any":
+    if key not in d or not d[key]:
+        raise ValueError(f"main:: discovery document missing required key: {key}")
+    return d[key]
+
+
+@dataclass
+class RequestHandler:
+    """
+    RequestHandler takes care of all the requests logic required
+    during the experiments with backstage backend
+    """
+
+    timeout: "float" = TIMEOUT
+
+    def http_get_json(
+        self, url: "str", headers: "dict[str, Any] | None" = None
+    ) -> "dict[str, Any]":
+        """
+        sends a GET request to the given url with the given headers
+        """
+        logger.debug(f"RquestHandler:: GET url {url}")
+        r = requests.get(url, headers=headers or {}, timeout=self.timeout)
+        r.raise_for_status()
+        return r.json()
+
+    def http_post_json(
+        self,
+        url: "str",
+        payload: "dict[str, Any]",
+        extra_headers: "dict[str, str] | None" = None,
+    ) -> "dict[str, Any]":
+        """
+        sends a POST request to the given url with the given headers
+        """
+        _headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if extra_headers:
+            _headers.update(extra_headers)
+
+        logger.debug(
+            f"RequestHandler:: POST {url} payload={json.dumps(payload, separators=(',', ':'))}"
+        )
+
+        res = requests.post(url, json=payload, headers=_headers, timeout=TIMEOUT)
+
+        ctype = res.headers.get("content-type", "")
+        if not res.ok and "application/json" in ctype:
+            try:
+                err = res.json()
+                raise requests.HTTPError(
+                    f"{res.status_code} {res.reason} {json.dumps(err)}"
+                )
+            except Exception:
+                pass
+            res.raise_for_status()
+        return res.json()
+
+
+@dataclass
+class Discovery:
+    """
+    discovery is an abstracton used to handle the results we get from
+    endpoint discovery
+    """
+
+    authorization_endpoint: "str"
+    token_endpoint: "str"
+    registration_endpoint: "str"
+    raw: "dict[str, Any]"
+    issuer: "str | None"
+    jwks_uri: "str | None"
+
+    @classmethod
+    def from_dict(cls, discovery_dict: "dict[str, Any]") -> "Discovery":
+        """
+        creates a Discovery instance from a given dict
+        """
+        # According to RFC8414 registration endpoint is optional
+        # https://datatracker.ietf.org/doc/html/rfc8414
+        if "registration_endpoint" not in discovery_dict:
+            raise ValueError(
+                "Discovery:: no registration_endpoint in discovery; server may not support DCR"
+            )
+        return cls(
+            issuer=discovery_dict.get("issuer"),
+            authorization_endpoint=get_key_or_raise_error(
+                discovery_dict, "authorization_endpoint"
+            ),
+            token_endpoint=get_key_or_raise_error(discovery_dict, "token_endpoint"),
+            jwks_uri=discovery_dict.get("jwks_uri"),
+            registration_endpoint=get_key_or_raise_error(
+                discovery_dict, "registration_endpoint"
+            ),
+            raw=discovery_dict,
+        )
+
+
+@dataclass
+class BackstageDCRHandler:
+    """
+    BackstageDCRHandler is the main class handling the discovery and
+    client registration
+    """
+
+    oauth_discovery: "str" = (
+        f"{DEFAULT_BACKEND_BASE}/.well-known/oauth-authorization-server"
+    )
+    oidc_discovery: "str" = f"{DEFAULT_BACKEND_BASE}/.well-known/openid-configuration"
+    request_handler = RequestHandler()
+
+    def discover(self) -> "Discovery":
+        """
+        attempts to discover endpoints for auth
+        """
+        errors = []
+        for url in (self.oauth_discovery, self.oidc_discovery):
+            try:
+                doc = self.request_handler.http_get_json(url)
+                logger.info(f"DiscoveryHandler:: discovered metadata from: {url}")
+
+                if url.endswith("oauth-authorization-server"):
+                    logger.debug(
+                        "DiscoveryHandler:: found OAuth authorization server metadata)."
+                    )
+                else:
+                    logger.debug(
+                        "DiscoveryHandler:: looks like OpenID connect discovery 1.0."
+                    )
+
+                return Discovery.from_dict(doc)
+            except Exception as e:
+                errors.append(f"{url}: {e}")
+
+        raise RuntimeError(
+            "DiscoveryHandler:: failed at both endpoints:\n  - " + "\n  - ".join(errors)
+        )
+
+    def register(
+        self, disc: "Discovery", headers: "dict[str, str]"
+    ) -> "dict[str, Any]":
+        """
+        registers a client in backstage
+        """
+        return self.request_handler.http_post_json(
+            disc.registration_endpoint,
+            CLIENT_METADATA,
+            extra_headers=headers,
+        )
+
+    def save(disc: "Discovery", res: "dict[str, Any]") -> "None":
+        """
+        saves your credentials locally
+        """
+        out = {
+            "discovery": {
+                "issuer": disc.issuer,
+                "authorization_endpoint": disc.authorization_endpoint,
+                "token_endpoint": disc.token_endpoint,
+                "jwks_uri": disc.jwks_uri,
+                "registration_endpoint": disc.registration_endpoint,
+            },
+            "client": {
+                "client_id": res.get("client_id"),
+                "client_secret": res.get("client_secret"),
+                "client_id_issued_at": res.get("client_id_issued_at"),
+                "client_secret_expires_at": res.get("client_secret_expires_at"),
+                "registration_client_uri": res.get("registration_client_uri"),
+                "registration_access_token": res.get("registration_access_token"),
+                "metadata_submitted": CLIENT_METADATA,
+                "metadata_returned": res,
+            },
+            "saved_at": int(time.time()),
+        }
+
+        with open(OUTPUT_FILE, "w") as f:
+            json.dump(out, f, indent=2, sort_keys=False)
+
+        logger.info(f"main:: Creds saved at {OUTPUT_FILE}")
+
+
+def main() -> "int":
+    logger.info(f"main:: Backend base: {DEFAULT_BACKEND_BASE}")
+
+    dcr_handler = BackstageDCRHandler()
+    disc = dcr_handler.discover()
+
+    logger.info("main:: Discovered: \n")
+    logger.info("main:: authorization_endpoint: %s", disc.authorization_endpoint)
+    logger.info("main:: token_endpoint:        %s", disc.token_endpoint)
+    logger.info("main:: jwks_uri:              %s", disc.jwks_uri)
+    logger.info("main:: registration_endpoint: %s", disc.registration_endpoint)
+
+    headers = {}
+    if INITIAL_ACCESS_TOKEN:
+        headers["Authorization"] = f"Bearer {INITIAL_ACCESS_TOKEN}"
+
+    res = dcr_handler.register(disc, headers)
+
+    dcr_handler.save(disc, res)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as e:
+        logger.error("main:: FAILED: %s", e)
+        raise
