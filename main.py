@@ -319,6 +319,9 @@ class BackstageDCRHandler:
         code_challenge = self._b64url_sha256(code_verifier.encode("ascii"))
         state = self._urlsafe_random(16)
 
+        # NOTE: This is not implemented yet on the backstage side:
+        # see https://github.com/backstage/backstage/pull/30606#issue-3248826365
+        # That said redirection will give 404.
         authz_url = self.build_authorization_url(
             disc=disc,
             client_id=client_id,
