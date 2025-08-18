@@ -13,8 +13,8 @@ This script runs a full `OAuth 2.0` flow against a local Backstage backend insta
 3. Fetches the **authorization code** (following the [PKCE protocol](https://www.rfc-editor.org/rfc/rfc7636)).It starts by buidling the authorization url, then captures the session id, and then approves it as a Guest Backstage user. Finally it extracts the `code` from the redirect url that the `/token` endpoint returns, and exchanges it for JWT tokens.
 4. It finally dumps the credentials locally in order to have all the information of this run in place.
 
-**NOTE**: It's a PoC and it uses a guest token. Don't use this code in production.
-**NOTE**: As the frontend plugin for [backstage#300606](https://github.com/backstage/backstage/pull/30606) is not yet implemented, we have by-passed the UI implementation to deal with the authorization and the approval of the session.
+> **NOTE**: It's a PoC and it uses a guest token. Don't use this code in production.
+> **NOTE**: As the frontend plugin for [backstage#300606](https://github.com/backstage/backstage/pull/30606) is not yet implemented, we have by-passed the UI implementation to deal with the authorization and the approval of the session.
 
 ### Flow
 
