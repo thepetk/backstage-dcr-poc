@@ -31,12 +31,6 @@ DEFAULT_BACKEND_BASE = os.getenv(
     "BACKSTAGE_BASE_URL", "http://localhost:7007/api/auth"
 ).rstrip("/")
 
-# INITIAL_ACCESS_TOKEN [OPTIONAL]: any already existing
-# bearer token
-INITIAL_ACCESS_TOKEN = os.getenv(
-    "INITIAL_ACCESS_TOKEN", "uSaiGYA7UmzpnyIRjVeJvA9dSyP4ztJc"
-)
-
 # OUTPUT_FILE: The path we are going to save the credentials
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "oauth_credentials.json")
 
