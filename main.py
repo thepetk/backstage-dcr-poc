@@ -22,6 +22,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import requests
 
@@ -32,7 +33,9 @@ DEFAULT_BACKEND_BASE = os.getenv(
 
 # INITIAL_ACCESS_TOKEN [OPTIONAL]: any already existing
 # bearer token
-INITIAL_ACCESS_TOKEN = os.getenv("INITIAL_ACCESS_TOKEN")
+INITIAL_ACCESS_TOKEN = os.getenv(
+    "INITIAL_ACCESS_TOKEN", "uSaiGYA7UmzpnyIRjVeJvA9dSyP4ztJc"
+)
 
 # OUTPUT_FILE: The path we are going to save the credentials
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "oauth_credentials.json")
@@ -55,6 +58,10 @@ CLIENT_METADATA: "dict[str, Any]" = {
     "software_version": "0.1.0",
 }
 
+# BACKSTAGE_USER: The ref of the user we want to authenticate
+# default value is the guest user
+BACKSTAGE_USER = os.getenv("BACKSTAGE_USER", "user:default/guest")
+
 # RUN_AUTH_CODE_FLOW: Flag to run the authorization code generation
 RUN_AUTH_CODE_FLOW: "bool" = bool(os.getenv("RUN_AUTH_CODE_FLOW", 1))
 
@@ -64,6 +71,12 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger("dcr")
+
+
+class BackstageEndpoints:
+    DISCOVERY = "{base_url}/.well-known/openid-configuration"
+    APPROVE = "{base_url}/v1/sessions/{session_id}/approve"
+    REFRESH = "{base_url}/guest/refresh"
 
 
 def get_key_or_raise_error(d: "dict[str, Any]", key: "str") -> "Any":
@@ -81,34 +94,34 @@ class RequestHandler:
 
     timeout: "float" = TIMEOUT
 
-    def http_get_json(
-        self, url: "str", headers: "dict[str, Any] | None" = None
-    ) -> "dict[str, Any]":
+    def get(
+        self,
+        url: "str",
+        headers: "dict[str, Any] | None" = None,
+        allow_redirects: "bool" = True,
+    ) -> "requests.Response":
         """
         sends a GET request to the given url with the given headers
         """
         logger.debug(f"RquestHandler:: GET url {url}")
-        r = requests.get(url, headers=headers or {}, timeout=self.timeout)
-        r.raise_for_status()
-        return r.json()
+        res = requests.get(
+            url,
+            headers=headers or {},
+            timeout=self.timeout,
+            allow_redirects=allow_redirects,
+        )
+        return res
 
-    def http_post_json(
+    def post(
         self,
         url: "str",
         payload: "dict[str, Any]",
         auth: "tuple[str, str] | None" = None,
-        extra_headers: "dict[str, str] | None" = None,
-    ) -> "dict[str, Any]":
+        headers: "dict[str, str] | None" = None,
+    ) -> "requests.Response":
         """
         sends a POST request to the given url with the given headers
         """
-        _headers = {"Content-Type": "application/json", "Accept": "application/json"}
-        if auth:
-            _headers["Content-Type"] = "application/x-www-form-urlencoded"
-
-        if extra_headers:
-            _headers.update(extra_headers)
-
         logger.debug(
             f"RequestHandler:: POST {url} payload={json.dumps(payload, separators=(',', ':'))}"
         )
@@ -117,7 +130,7 @@ class RequestHandler:
             res = requests.post(
                 url,
                 data=payload,
-                headers=_headers,
+                headers=headers,
                 timeout=self.timeout,
                 auth=auth,
             )
@@ -125,21 +138,10 @@ class RequestHandler:
             res = requests.post(
                 url,
                 json=payload,
-                headers=_headers,
+                headers=headers,
                 timeout=self.timeout,
             )
-
-        ctype = res.headers.get("content-type", "")
-        if not res.ok and "application/json" in ctype:
-            try:
-                err = res.json()
-                raise requests.HTTPError(
-                    f"{res.status_code} {res.reason} {json.dumps(err)}"
-                )
-            except Exception:
-                pass
-            res.raise_for_status()
-        return res.json()
+        return res
 
 
 @dataclass
@@ -188,48 +190,46 @@ class BackstageDCRHandler:
     client registration
     """
 
-    oauth_discovery: "str" = (
-        f"{DEFAULT_BACKEND_BASE}/.well-known/oauth-authorization-server"
-    )
-    oidc_discovery: "str" = f"{DEFAULT_BACKEND_BASE}/.well-known/openid-configuration"
+    user_entity_ref = BACKSTAGE_USER
     request_handler = RequestHandler()
+    base_url = DEFAULT_BACKEND_BASE
 
     def discover(self) -> "Discovery":
         """
         attempts to discover endpoints for auth
         """
-        errors = []
-        for url in (self.oauth_discovery, self.oidc_discovery):
-            try:
-                doc = self.request_handler.http_get_json(url)
-                logger.info(f"DiscoveryHandler:: discovered metadata from: {url}")
+        url = BackstageEndpoints.DISCOVERY.format(base_url=self.base_url)
+        try:
+            res = self.request_handler.get(url)
+            logger.info(f"DiscoveryHandler:: discovered metadata from: {url}")
 
-                if url.endswith("oauth-authorization-server"):
-                    logger.debug(
-                        "DiscoveryHandler:: found OAuth authorization server metadata)."
-                    )
-                else:
-                    logger.debug(
-                        "DiscoveryHandler:: looks like OpenID connect discovery 1.0."
-                    )
-
-                return Discovery.from_dict(doc)
-            except Exception as e:
-                errors.append(f"{url}: {e}")
-
-        raise RuntimeError(
-            "DiscoveryHandler:: failed at both endpoints:\n  - " + "\n  - ".join(errors)
-        )
+            return Discovery.from_dict(res.json())
+        except Exception as e:
+            raise RuntimeError(f"DiscoveryHandler:: discovery failed: {str(e)}")
 
     def register(self, disc: "Discovery", headers: "dict[str, str]") -> "dict[str, Any]":
         """
         registers a client in backstage
         """
-        return self.request_handler.http_post_json(
+        res = self.request_handler.post(
             disc.registration_endpoint,
             CLIENT_METADATA,
-            extra_headers=headers,
+            headers=headers,
         )
+        return res.json()
+
+    def get_token(self) -> "str":
+        """
+        gets a guest JWT token from /refresh
+        """
+        res = self.request_handler.get(
+            BackstageEndpoints.REFRESH.format(base_url=self.base_url),
+            headers={"Content": "application/json"},
+        )
+        res.raise_for_status()
+
+        res_dict = res.json()
+        return res_dict["backstageIdentity"]["token"]
 
     def save(self, disc: "Discovery", res: "dict[str, Any]") -> "None":
         """
@@ -297,14 +297,74 @@ class BackstageDCRHandler:
         }
         return f"{disc.authorization_endpoint}?{urllib.parse.urlencode(qs)}"
 
-    def run_auth_code_pkce(
+    def _extract_session_id(self, res: "requests.Response") -> "str":
+        """
+        extracts the authorization session id to tackle the missing
+        frontend plugin to authorize clients
+        """
+        loc1 = res.headers.get("location")
+        if not loc1:
+            raise RuntimeError(
+                "BackstageDCRHandler:: /authorize without Location header"
+            )
+        path = urllib.parse.urlparse(loc1).path
+        return [p for p in path.split("/") if p][-1]
+
+    def _update_creds(
+        self, redirect_uri: "str", state: "str", res: "dict[str, Any]"
+    ) -> "None":
+        "updates the credentials output file with the final creds"
+        try:
+            with open(OUTPUT_FILE, "r") as f:
+                current = json.load(f)
+        except Exception:
+            current = {}
+
+        current.setdefault("auth_test", {})
+        current["auth_test"]["pkce"] = {
+            "used_redirect_uri": redirect_uri,
+            "state": state,
+            "token_response": res,
+        }
+
+        with open(OUTPUT_FILE, "w") as f:
+            json.dump(current, f, indent=2)
+
+    def _parse_qs(self, q: "str", redirect_uri: "str") -> "str":
+        return parse_qs(urlparse(redirect_uri).query).get(q, [None])[0]
+
+    def approve(self, session_id: "str", user_entity_ref: "str") -> "tuple[str, str]":
+        url = BackstageEndpoints.APPROVE.format(
+            session_id=session_id, base_url=self.base_url
+        )
+        token = self.get_token()
+        payload = {"userEntityRef": user_entity_ref}
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+        res = self.request_handler.post(url, payload=payload, headers=headers)
+        try:
+            if res.status_code not in (200, 204):
+                res.raise_for_status()
+        except Exception as e:
+            raise RuntimeError(
+                f"BackstageDCRHandler:: approve failed ({res.status_code}): {e} :: {res.text}"
+            )
+
+        data = res.json()
+        auth_code = self._parse_qs("code", data["redirectUrl"])
+        returned_state = self._parse_qs("state", data["redirectUrl"])
+        return (auth_code, returned_state)
+
+    def pkce_authorize(
         self,
         disc: "Discovery",
         client: "dict[str, Any]",
         redirect_uri: "str",
     ) -> "dict[str, Any]":
         """
-        runs the browser Authorization Code - PKCE flow:
+        runs the pkce authorization flow:
         - prints an authorization URL
         - peads ?code= from stdin
         - exchanges code for tokens at token_endpoint
@@ -331,49 +391,59 @@ class BackstageDCRHandler:
             code_challenge=code_challenge,
         )
 
-        logger.info("BackstageDCRHandler:: === Authorization URL (open in browser) ===")
-        logger.info(f"BackstageDCRHandler:: authorization url {authz_url}")
-        logger.info(
-            "BackstageDCRHandler::After approving, paste the 'code' query param here."
-        )
-        code = input("BackstageDCRHandler:: Enter the code = ").strip()
-        if not code:
-            raise ValueError("BackstageDCRHandler:: No authorization code provided")
+        # We disable redirects to get the redirect url that the authorization
+        # front end will be returning to the user
+        redirect_res = self.request_handler.get(authz_url, allow_redirects=False)
+        if redirect_res.status_code not in (302, 303):
+            raise RuntimeError(
+                f"BackstageDCRHandler:: expected 302 from /authorize, got {redirect_res.status_code}"
+            )
 
-        # exchange tokens
-        payload = {
+        # extract the session id from the redirect url
+        session_id = self._extract_session_id(redirect_res)
+        if not session_id:
+            raise RuntimeError(
+                "BackstageDCRHandler:: failed to parse session id from Location"
+            )
+
+        logger.info(
+            f"BackstageDCRHandler:: captured authorization session id: {session_id}"
+        )
+
+        auth_code, returned_state = self.approve(session_id, self.user_entity_ref)
+
+        if not auth_code:
+            raise RuntimeError(
+                "BackstageDCRHandler:: redirect did not include an authorization code"
+            )
+
+        if returned_state != state:
+            logger.warning(
+                f"BackstageDCRHandler:: state mismatch: expected {state} got {returned_state}"
+            )
+
+        # exchange tokens with the auth_code
+        token_payload = {
             "grant_type": "authorization_code",
-            "code": code,
+            "code": auth_code,
             "redirect_uri": redirect_uri,
             "code_verifier": code_verifier,
+            "client_id": client_id,  # add this
+            "client_secret": client_secret,  # and this
         }
 
-        token_response = self.request_handler.http_post_json(
+        token_response = self.request_handler.post(
             disc.token_endpoint,
-            payload=payload,
+            payload=token_payload,
             auth=(client_id, client_secret),
         )
 
-        # update creds file
-        try:
-            with open(OUTPUT_FILE, "r") as f:
-                current = json.load(f)
-        except Exception:
-            current = {}
-
-        current.setdefault("auth_test", {})
-        current["auth_test"]["pkce"] = {
-            "used_redirect_uri": redirect_uri,
-            "state": state,
-            "token_response": token_response,
-        }
-
-        with open(OUTPUT_FILE, "w") as f:
-            json.dump(current, f, indent=2)
+        token_res_dict = token_response.json()
+        _ = self._update_creds(redirect_uri, state, token_res_dict)
         logger.info(
-            "main:: Auth Code  PKCE succeeded; tokens saved under 'auth_test.pkce'"
+            "main:: Auth Code + PKCE (no-UI) succeeded; tokens saved under 'auth_test.pkce'"
         )
-        return token_response
+        return token_response.json()
 
 
 def main() -> "int":
@@ -388,17 +458,13 @@ def main() -> "int":
     logger.info("main:: jwks_uri:              %s", disc.jwks_uri)
     logger.info("main:: registration_endpoint: %s", disc.registration_endpoint)
 
-    headers = {}
-    if INITIAL_ACCESS_TOKEN:
-        headers["Authorization"] = f"Bearer {INITIAL_ACCESS_TOKEN}"
-
-    res = dcr_handler.register(disc, headers)
+    res = dcr_handler.register(disc, {})
 
     dcr_handler.save(disc, res)
 
     if RUN_AUTH_CODE_FLOW:
         redirect_uri = CLIENT_METADATA["redirect_uris"][0]
-        dcr_handler.run_auth_code_pkce(
+        dcr_handler.pkce_authorize(
             disc=disc,
             client={
                 "client_id": res.get("client_id"),
