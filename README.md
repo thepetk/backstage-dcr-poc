@@ -14,6 +14,9 @@ This script runs a full `OAuth 2.0` flow against a local Backstage backend insta
 4. It finally dumps the credentials locally in order to have all the information of this run in place.
 
 > **NOTE**: It's a PoC and it uses a guest token. Don't use this code in production.
+
+---
+
 > **NOTE**: As the frontend plugin for [backstage#300606](https://github.com/backstage/backstage/pull/30606) is not yet implemented, we have by-passed the UI implementation to deal with the authorization and the approval of the session.
 
 ### Flow
