@@ -43,7 +43,8 @@ OUTPUT_FILE = os.getenv("OUTPUT_FILE", "oauth_credentials.json")
 # TIMEOUT: The timeout value for the backstage requests
 TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "10"))
 
-# CLIENT_METADATA: The medata required for lightspeed stack
+# CLIENT_METADATA: The metadata required requried for the registration
+# endpoint
 CLIENT_METADATA: "dict[str, Any]" = {
     "client_name": "lightspeed-stack (local dev)",
     "redirect_uris": [
@@ -60,7 +61,7 @@ CLIENT_METADATA: "dict[str, Any]" = {
 
 # BACKSTAGE_USER: The ref of the user we want to authenticate
 # default value is the guest user
-BACKSTAGE_USER = os.getenv("BACKSTAGE_USER", "user:default/guest")
+BACKSTAGE_USER = "user:default/guest"
 
 # RUN_AUTH_CODE_FLOW: Flag to run the authorization code generation
 RUN_AUTH_CODE_FLOW: "bool" = bool(os.getenv("RUN_AUTH_CODE_FLOW", 1))
@@ -459,19 +460,16 @@ def main() -> "int":
     logger.info("main:: registration_endpoint: %s", disc.registration_endpoint)
 
     res = dcr_handler.register(disc, {})
-
     dcr_handler.save(disc, res)
-
-    if RUN_AUTH_CODE_FLOW:
-        redirect_uri = CLIENT_METADATA["redirect_uris"][0]
-        dcr_handler.pkce_authorize(
-            disc=disc,
-            client={
-                "client_id": res.get("client_id"),
-                "client_secret": res.get("client_secret"),
-            },
-            redirect_uri=redirect_uri,
-        )
+    redirect_uri = CLIENT_METADATA["redirect_uris"][0]
+    dcr_handler.pkce_authorize(
+        disc=disc,
+        client={
+            "client_id": res.get("client_id"),
+            "client_secret": res.get("client_secret"),
+        },
+        redirect_uri=redirect_uri,
+    )
     return 0
 
 
