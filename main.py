@@ -27,6 +27,8 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 from fastmcp import Client
+from fastmcp.client.auth import BearerAuth
+from fastmcp.client.auth.oauth import OAuth
 from fastmcp.client.transports import StreamableHttpTransport
 from fastmcp.tools import Tool
 
@@ -34,6 +36,11 @@ from fastmcp.tools import Tool
 DEFAULT_BACKEND_BASE = os.getenv("BACKSTAGE_BASE_URL", "http://localhost:7007").rstrip(
     "/"
 )
+
+# SKIP_DCR: Skips the DCR handler process and tries auth
+# directly from the fastmcp client.
+SKIP_DCR = bool(os.getenv("SKIP_DCR", False))
+
 # DEFAULT_BACKEND_AUTH_BASE: Default base for auth endpoints
 DEFAULT_BACKEND_AUTH_BASE = os.getenv(
     "BACKSTAGE_BASE_URL", "http://localhost:7007/api/auth"
@@ -366,7 +373,7 @@ class BackstageDCRHandler:
         disc: "Discovery",
         client: "dict[str, Any]",
         redirect_uri: "str",
-    ) -> "dict[str, Any]":
+    ) -> "str":
         """
         runs the pkce authorization flow:
         - prints an authorization URL
@@ -432,8 +439,8 @@ class BackstageDCRHandler:
             "code": auth_code,
             "redirect_uri": redirect_uri,
             "code_verifier": code_verifier,
-            "client_id": client_id,  # add this
-            "client_secret": client_secret,  # and this
+            "client_id": client_id,
+            "client_secret": client_secret,
         }
 
         token_response = self.request_handler.post(
@@ -447,27 +454,34 @@ class BackstageDCRHandler:
         logger.info(
             "main:: Auth Code + PKCE (no-UI) succeeded; tokens saved under 'auth_test.pkce'"
         )
-        return token_response.json()
+        return token_res_dict["access_token"]
 
 
 @dataclass
 class BackstageMCPClient:
-    token: "str"
+    access_token: "str"
+    exclude_dcr_handler: "bool"
     base_url = DEFAULT_BACKEND_BASE
 
     @property
-    def mcp_headers(self) -> "dict[str, str]":
-        return {
-            "Authorization": f"Bearer {self.token}",
-            "Accept": "application/json, text/event-stream",
-        }
+    def transport(self) -> "StreamableHttpTransport":
+        # NOTE: enabling exclude_dcr_handler won't work
+        # as the frontend side of https://github.com/backstage/backstage/issues/30069
+        # is not implemented yet
+        if self.exclude_dcr_handler:
+            return StreamableHttpTransport(
+                url=BackstageEndpoints.MCP_ACTIONS.format(base_url=self.base_url),
+                auth=OAuth(mcp_url="http://localhost:7007/api/mcp-actions/v1"),
+            )
+        # default approach we are passing the DCR handler's token.
+        return StreamableHttpTransport(
+            url=BackstageEndpoints.MCP_ACTIONS.format(base_url=self.base_url),
+            auth=BearerAuth(token=self.access_token),
+            headers={"Accept": "application/json, text/event-stream"},
+        )
 
     def get_client(self) -> "Client":
-        transport = StreamableHttpTransport(
-            url=BackstageEndpoints.MCP_ACTIONS.format(base_url=self.base_url),
-            headers=self.mcp_headers,
-        )
-        return Client(transport)
+        return Client(self.transport)
 
     def _output_tools(self, tools: "list[Tool]") -> "None":
         """
@@ -495,28 +509,30 @@ class BackstageMCPClient:
 def main() -> "int":
     logger.info(f"main:: Backend base: {DEFAULT_BACKEND_BASE}")
     logger.info(f"main:: Backend auth base: {DEFAULT_BACKEND_AUTH_BASE}")
+    token = ""
 
-    dcr_handler = BackstageDCRHandler()
-    disc = dcr_handler.discover()
+    if SKIP_DCR is False:
+        dcr_handler = BackstageDCRHandler()
+        disc = dcr_handler.discover()
 
-    logger.info("main:: Discovered: \n")
-    logger.info("main:: authorization_endpoint: %s", disc.authorization_endpoint)
-    logger.info("main:: token_endpoint:        %s", disc.token_endpoint)
-    logger.info("main:: jwks_uri:              %s", disc.jwks_uri)
-    logger.info("main:: registration_endpoint: %s", disc.registration_endpoint)
+        logger.info("main:: Discovered: \n")
+        logger.info("main:: authorization_endpoint: %s", disc.authorization_endpoint)
+        logger.info("main:: token_endpoint:        %s", disc.token_endpoint)
+        logger.info("main:: jwks_uri:              %s", disc.jwks_uri)
+        logger.info("main:: registration_endpoint: %s", disc.registration_endpoint)
 
-    res = dcr_handler.register(disc, {})
-    dcr_handler.save(disc, res)
-    redirect_uri = CLIENT_METADATA["redirect_uris"][0]
-    token_res = dcr_handler.pkce_authorize(
-        disc=disc,
-        client={
-            "client_id": res.get("client_id"),
-            "client_secret": res.get("client_secret"),
-        },
-        redirect_uri=redirect_uri,
-    )
-    mcp_client = BackstageMCPClient(token=token_res["access_token"])
+        res = dcr_handler.register(disc, {})
+        dcr_handler.save(disc, res)
+        redirect_uri = CLIENT_METADATA["redirect_uris"][0]
+        token = dcr_handler.pkce_authorize(
+            disc=disc,
+            client={
+                "client_id": res.get("client_id"),
+                "client_secret": res.get("client_secret"),
+            },
+            redirect_uri=redirect_uri,
+        )
+    mcp_client = BackstageMCPClient(access_token=token, exclude_dcr_handler=SKIP_DCR)
     asyncio.run(mcp_client.get_backstage_tools())
     return 0
 
