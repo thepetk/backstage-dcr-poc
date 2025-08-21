@@ -100,6 +100,12 @@ CLIENT_METADATA: "dict[str, Any]" = {
 
    - **Specs:** From OAuth 2.0 [RFC 6749](https://www.rfc-editor.org/rfc/rfc6749) and the [OIDC Core 1.0 — Token Request](https://openid.net/specs/openid-connect-core-1_0.html#TokenRequest)
 
+### The `BackstageMCPClient` class
+
+In order to verify that the PoC works we have implemented the `BackstageMCPClient` class as an abstraction over the `FastMCP` client.
+
+The process we follow is very simple in `main.py`. We simply run the `BackstageDCRHandler` pkce flow to obtain the access token and pass it to the `BackstageMCPClient` so we can list all the tools available in backstage.
+
 ## Usage
 
 This project requires some steps to be taken prior running the script.
