@@ -146,3 +146,4 @@ The following env vars can be configured
 - `BACKSTAGE_BASE_URL`: The base url of backstage (default `http://localhost:7007/api/auth`)
 - `OUTPUT_FILE`: The path to save the creds locally (default `oauth_credentials.json`)
 - `HTTP_TIMEOUT`: The default request timeout (default `10`)
+- `SKIP_DCR`: Skips the `BackstageDCRHandler` flow and attempts to run OAuth through the `fastmcp.Client` (more specifically the `StreamableHttpTransport` instance). **This is not supported** as the authorization redirect will fail (the frontend is not implemented yet)
