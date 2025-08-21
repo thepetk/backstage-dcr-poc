@@ -13,6 +13,7 @@
 # used for production as there is a risk of leaking
 # sensitive data.
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -25,9 +26,16 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import requests
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
+from fastmcp.tools import Tool
 
-# DEFAULT_BACKEND_BASE: Default base for auth endpoints
-DEFAULT_BACKEND_BASE = os.getenv(
+# DEFAULT_BACKEND_BASE: Default base for backstage urls
+DEFAULT_BACKEND_BASE = os.getenv("BACKSTAGE_BASE_URL", "http://localhost:7007").rstrip(
+    "/"
+)
+# DEFAULT_BACKEND_AUTH_BASE: Default base for auth endpoints
+DEFAULT_BACKEND_AUTH_BASE = os.getenv(
     "BACKSTAGE_BASE_URL", "http://localhost:7007/api/auth"
 ).rstrip("/")
 
@@ -72,6 +80,7 @@ class BackstageEndpoints:
     DISCOVERY = "{base_url}/.well-known/openid-configuration"
     APPROVE = "{base_url}/v1/sessions/{session_id}/approve"
     REFRESH = "{base_url}/guest/refresh"
+    MCP_ACTIONS = "{base_url}/api/mcp-actions/v1"
 
 
 def get_key_or_raise_error(d: "dict[str, Any]", key: "str") -> "Any":
@@ -187,7 +196,7 @@ class BackstageDCRHandler:
 
     user_entity_ref = BACKSTAGE_USER
     request_handler = RequestHandler()
-    base_url = DEFAULT_BACKEND_BASE
+    base_url = DEFAULT_BACKEND_AUTH_BASE
 
     def discover(self) -> "Discovery":
         """
@@ -441,8 +450,51 @@ class BackstageDCRHandler:
         return token_response.json()
 
 
+@dataclass
+class BackstageMCPClient:
+    token: "str"
+    base_url = DEFAULT_BACKEND_BASE
+
+    @property
+    def mcp_headers(self) -> "dict[str, str]":
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/json, text/event-stream",
+        }
+
+    def get_client(self) -> "Client":
+        transport = StreamableHttpTransport(
+            url=BackstageEndpoints.MCP_ACTIONS.format(base_url=self.base_url),
+            headers=self.mcp_headers,
+        )
+        return Client(transport)
+
+    def _output_tools(self, tools: "list[Tool]") -> "None":
+        """
+        outputs the list of tools fetched from backstage
+        """
+        if len(tools) == 0:
+            logger.info("BackstageMCPClient:: No tools found")
+            return
+
+        logger.info(f"BackstageMCPClient:: Found {len(tools)}")
+        for tool in tools:
+            logger.info(f"Tool: {tool.name}")
+
+    async def get_backstage_tools(self, verbose=True) -> "list":
+        client = self.get_client()
+
+        async with client:
+            await client.ping()
+            tools = await client.list_tools()
+            if verbose:
+                self._output_tools(tools)
+            return tools
+
+
 def main() -> "int":
     logger.info(f"main:: Backend base: {DEFAULT_BACKEND_BASE}")
+    logger.info(f"main:: Backend auth base: {DEFAULT_BACKEND_AUTH_BASE}")
 
     dcr_handler = BackstageDCRHandler()
     disc = dcr_handler.discover()
@@ -456,7 +508,7 @@ def main() -> "int":
     res = dcr_handler.register(disc, {})
     dcr_handler.save(disc, res)
     redirect_uri = CLIENT_METADATA["redirect_uris"][0]
-    dcr_handler.pkce_authorize(
+    token_res = dcr_handler.pkce_authorize(
         disc=disc,
         client={
             "client_id": res.get("client_id"),
@@ -464,6 +516,8 @@ def main() -> "int":
         },
         redirect_uri=redirect_uri,
     )
+    mcp_client = BackstageMCPClient(token=token_res["access_token"])
+    asyncio.run(mcp_client.get_backstage_tools())
     return 0
 
 
