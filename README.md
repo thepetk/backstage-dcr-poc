@@ -56,9 +56,11 @@ CLIENT_METADATA: "dict[str, Any]" = {
 - **Response:** `client_id`, often `client_secret`, timestamps, and echoed metadata
 - **Specs:** OAuth 2.0 Dynamic Client Registration as defined in [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591).
 
-#### Authorization Code + PKCE
+#### ByPassing the Browser Authorization
 
-> **NOTE**: Here in order to tackle the absence of frontend UI where the user can authorize the session that the client registration creates we have implemented an alternative flow.
+In the normal flow ideally we would have a frontend page that would stand as the authorization point, where the session created should be approved. This is missing from [backstage#300606](https://github.com/backstage/backstage/pull/30606) so we are using a work around to get things working. That said we are constructing the authorization url and then we extract the session-id from it. We approve the session using a guest JWT token and then we are free to proceed with token exchange.
+
+#### Authorization Code + PKCE
 
 1. **Create PKCE and state**
 
